@@ -6,6 +6,9 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ## [Unreleased]
+
+### Changed
+
 - Pass down number of ensembles from configurations to `ProbabilisticAdvection`. This gives a roughly 3x speedup in the no ensembles case.
 
 ## [v1.1.0]
