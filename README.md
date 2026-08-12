@@ -101,7 +101,6 @@ podman run -it --rm --entrypoint="" sunflow bash
 |----------|---------|-------------|
 | `NOWCAST_DIRECTORY` | `.` | Directory for forecast output files |
 | `SATELLITE_DATA_DIRECTORY` | `.` | Directory for input satellite data archive |
-| `ENS_MEMBERS` | `1` | Number of ensemble members |
 | `PAST_STEPS` | `4` | Number of past time steps for motion field |
 | `FUTURE_STEPS` | `24` | Number of forecast time steps |
 | `INPUT_DATA_AVAILABILITY_DELAY_MINUTES` | `24` | Data availability delay (minutes) |
@@ -109,6 +108,7 @@ podman run -it --rm --entrypoint="" sunflow bash
 | `MAX_WAITING_TIME_MINUTES` | `27` | Maximum wait time for data (minutes) |
 | `MAX_CLEARSKY_FALLBACK_DAYS` | `3` | Days back to search for fallback clear-sky data |
 | `MIN_SOLAR_ELEVATION_DEGREES` | `6` | Minimum maximum-corner solar elevation required to run |
+| `ENSEMBLE_STATISTICS` | `median,mean,p10,p25,p75,p90` | Comma-separated list of statistics for ensemble output. Allowed: `median`, `mean`, `p10`, `p25`, `p75`, `p90` (aliases `10th_percentile`, `25th_percentile`, `75th_percentile`, `90th_percentile` are accepted). |
 
 #### Data Source Configuration
 
@@ -135,12 +135,20 @@ podman run -it --rm --entrypoint="" sunflow bash
 ### Arguments
 
 - `--dataset` - Choose between KNMI or DWD data sources
-- `--bbox` - Predefined bounding boxes (DENMARK, NW_EUROPE, CUSTOM)
-- `--custom-bbox` - Custom bounding box (lon_min,lat_min,lon_max,lat_max)
+- `--domain_satellite` - Domain for required satellite input coverage (DENMARK, NW_EUROPE, NW_EUROPE_SATELLITE, CUSTOM)
+- `--custom_domain_satellite` - Custom `domain_satellite` (lon_min,lat_min,lon_max,lat_max)
+- `--domain_nowcast` - Domain written to output (DENMARK, NW_EUROPE, NW_EUROPE_SATELLITE, CUSTOM, defaults to `--domain_satellite`)
+- `--custom_domain_nowcast` - Custom `domain_nowcast` (lon_min,lat_min,lon_max,lat_max)
 - `--time` - Specific time for processing in ISO8601 format
-- `--start-time` - Start of a time range in ISO8601 format (use with `--end-time`)
-- `--end-time` - End of a time range in ISO8601 format, inclusive (use with `--start-time`)
+- `--start_time` - Start of a time range in ISO8601 format (use with `--end_time`)
+- `--end_time` - End of a time range in ISO8601 format, inclusive (use with `--start_time`)
 - `--run_mode` - Specify run mode: `download` (fetch from API), `files` (local files), or `s3` (object storage)
+- `--ensemble_members` - Number of ensemble members (Default 1)
+- `--full_ensemble` - Specify that the full ensemble is the desired output rather than ensemble statistics
+
+For ensemble runs (`--ensemble_members > 1`), default output is the configured
+ensemble statistics from `ENSEMBLE_STATISTICS`. Use `--full_ensemble` to output
+all members instead.
 
 ## Data Sources
 

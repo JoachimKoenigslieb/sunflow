@@ -1,4 +1,5 @@
 #!/usr/bin/env python3
+import argparse
 import os
 import sys
 from datetime import datetime
@@ -10,6 +11,7 @@ import xarray as xr
 from loguru import logger
 
 from .config import NowcastConfig
+from .geospatial import parse_bbox
 
 
 class MissingClearskyDataError(RuntimeError):
@@ -18,6 +20,27 @@ class MissingClearskyDataError(RuntimeError):
 
 class DataNotAvailableError(RuntimeError):
     pass
+
+
+def validate_custom_domain(
+    parser: argparse.ArgumentParser,
+    domain_choice: str | None,
+    custom_domain: str | None,
+    domain_arg: str,
+    custom_arg: str,
+) -> None:
+    if domain_choice == "CUSTOM":
+        if not custom_domain:
+            parser.error(f"{custom_arg} is required when {domain_arg}=CUSTOM")
+        try:
+            parse_bbox(custom_domain)
+        except ValueError as e:
+            parser.error(
+                f"Invalid {custom_arg} format: {e}. "
+                "Use format 'lon_min,lat_min,lon_max,lat_max'"
+            )
+    elif custom_domain:
+        parser.error(f"{custom_arg} is only valid when {domain_arg}=CUSTOM")
 
 
 def validate_config(config: dict[str, Any], dataset_name: str) -> None:
@@ -49,19 +72,20 @@ def validate_config(config: dict[str, Any], dataset_name: str) -> None:
 def validate_nowcast_config(nowcast_config: NowcastConfig) -> None:
     """Validate that the options selected for the nowcast config are valid.
 
-    Checks the nowcast config created from imported environment variables.
+    Checks the nowcast config for validity.
     Exits immediately for invalid choices.
 
     Args:
         nowcast_config: Instance of the NowcastConfig class
-        loaded from environment variables in config.py.
+        defined in config.py.
 
     Raises:
         SystemExit: If any invalid choice is detected.
     """
-    if nowcast_config.ens_members != 1:
+    if nowcast_config.ens_members <= 0:
         logger.error(
-            f"Invalid nowcast configuration: Currently, only ens_members=1 is supported. "
+            f"Invalid nowcast configuration: Number of ensemble members "
+            f"must be greater than 0. "
             f"Current value: {nowcast_config.ens_members}. Exiting.\n"
         )
         sys.exit(1)
