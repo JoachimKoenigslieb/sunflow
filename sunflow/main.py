@@ -13,7 +13,7 @@ from loguru import logger
 from pysteps.motion.lucaskanade import dense_lucaskanade
 
 from . import __version__
-from .config import NowcastConfig, S3Config
+from .config import DOMAIN_OPTIONS, NowcastConfig, S3Config
 from .data_io import (
     fetch_clearsky_with_fallback,
     fetch_current_data_with_retry,
@@ -22,15 +22,31 @@ from .data_io import (
     save_forecast,
 )
 from .downloaders import download_past_data
-from .forecast import multiply_clearsky, preprocess_data, simple_advection_forecast
-from .geospatial import check_solar_elevation, get_bbox
+from .forecast import (
+    compute_ensemble_statistics,
+    make_pvlib_clearsky_dataset,
+    multiply_clearsky,
+    prepend_t0,
+    preprocess_data,
+    probabilistic_advection_forecast,
+)
+from .geospatial import (
+    check_solar_elevation,
+    crop_forecast_to_domain,
+    domain_contains,
+    get_coordinates,
+    resolve_domain_bbox,
+    validate_dataset_covers_domain,
+)
 from .time_handler import generate_time_steps, round_time
 from .validation import (
     MissingClearskyDataError,
     validate_clearsky_completeness,
     validate_clearsky_shapes,
     validate_config,
+    validate_custom_domain,
     validate_data_shape,
+    validate_nowcast_config,
     validate_run_mode,
     verify_environment_variables,
 )
@@ -52,17 +68,18 @@ class RunResult:
 # Model version
 model_version = __version__
 
+DOMAIN_CHOICES = tuple(DOMAIN_OPTIONS)
+
 
 def parse_arguments() -> argparse.Namespace:
     """Parse and validate command line arguments.
 
-    Defines arguments for run mode, dataset, bounding box, and an optional
-    custom time override. Validates that --custom-bbox is provided and
-    correctly formatted when --bbox=CUSTOM is selected.
+    Defines arguments for run mode, dataset, spatial domains, and an optional
+    custom time override.
 
     Returns:
         Parsed argument namespace with attributes run_mode, dataset,
-        bbox, custom_bbox, and time.
+        domain_satellite, domain_nowcast, and time.
     """
 
     def parse_datetime_with_timezone(datetime_str: str) -> datetime:
@@ -103,15 +120,30 @@ def parse_arguments() -> argparse.Namespace:
         "(default: KNMI)",
     )
     parser.add_argument(
-        "--bbox",
-        choices=["DENMARK", "NW_EUROPE", "CUSTOM"],
+        "--domain_satellite",
+        choices=DOMAIN_CHOICES,
         default="NW_EUROPE",
-        help="Choose bounding box (default: NW_EUROPE)",
+        help="Domain required for satellite input coverage (default: NW_EUROPE)",
     )
     parser.add_argument(
-        "--custom-bbox",
+        "--custom_domain_satellite",
         type=str,
-        help='Custom bbox in format "lon_min,lat_min,lon_max,lat_max"',
+        help='Custom domain_satellite in format "lon_min,lat_min,lon_max,lat_max"',
+        default=None,
+    )
+    parser.add_argument(
+        "--domain_nowcast",
+        choices=DOMAIN_CHOICES,
+        default=None,
+        help=(
+            "Domain written to forecast output. Defaults to domain_satellite "
+            "when omitted"
+        ),
+    )
+    parser.add_argument(
+        "--custom_domain_nowcast",
+        type=str,
+        help='Custom domain_nowcast in format "lon_min,lat_min,lon_max,lat_max"',
         default=None,
     )
     parser.add_argument(
@@ -121,43 +153,60 @@ def parse_arguments() -> argparse.Namespace:
         default=None,
     )
     parser.add_argument(
-        "--start-time",
+        "--start_time",
         type=parse_datetime_with_timezone,
-        help="Start of time span in ISO8601 format. Use with --end-time.",
+        help="Start of time span in ISO8601 format. Use with --end_time.",
         default=None,
     )
     parser.add_argument(
-        "--end-time",
+        "--end_time",
         type=parse_datetime_with_timezone,
-        help="End of time span in ISO8601 format (inclusive). Use with --start-time.",
+        help="End of time span in ISO8601 format (inclusive). Use with --start_time.",
         default=None,
+    )
+    parser.add_argument(
+        "--ensemble_members",
+        type=int,
+        default=1,
+        help="Number of ensemble members (default: 1)",
+    )
+    parser.add_argument(
+        "--full_ensemble",
+        action="store_true",
+        help=(
+            "Save full ensemble output. By default, ensemble statistics are "
+            "saved for ensemble runs."
+        ),
     )
 
     args = parser.parse_args()
 
     # Validate time arguments
     if args.time and (args.start_time or args.end_time):
-        parser.error("--time cannot be combined with --start-time/--end-time")
+        parser.error("--time cannot be combined with --start_time/--end_time")
     if bool(args.start_time) != bool(args.end_time):
-        parser.error("--start-time and --end-time must be provided together")
+        parser.error("--start_time and --end_time must be provided together")
     if args.start_time and args.end_time and args.start_time > args.end_time:
-        parser.error("--start-time must be before --end-time")
+        parser.error("--start_time must be before --end_time")
 
-    # Validate custom bbox
-    if args.bbox == "CUSTOM":
-        if not args.custom_bbox:
-            parser.error("--custom-bbox is required when --bbox=CUSTOM")
-        try:
-            # Validate format by trying to parse
-            bbox_parts = args.custom_bbox.split(",")
-            if len(bbox_parts) != 4:
-                raise ValueError("Must have exactly 4 comma-separated values")
-            [float(x) for x in bbox_parts]  # Ensure all are numeric
-        except ValueError as e:
-            parser.error(
-                f"Invalid --custom-bbox format: {e}. "
-                "Use format 'lon_min,lat_min,lon_max,lat_max'"
-            )
+    validate_custom_domain(
+        parser,
+        args.domain_satellite,
+        args.custom_domain_satellite,
+        "--domain_satellite",
+        "--custom_domain_satellite",
+    )
+
+    if args.domain_nowcast is None and args.custom_domain_nowcast:
+        parser.error("--custom_domain_nowcast requires --domain_nowcast=CUSTOM")
+
+    validate_custom_domain(
+        parser,
+        args.domain_nowcast,
+        args.custom_domain_nowcast,
+        "--domain_nowcast",
+        "--custom_domain_nowcast",
+    )
 
     return args
 
@@ -166,11 +215,13 @@ def run_nowcast(
     time_step: datetime,
     run_mode: str,
     config: dict,
-    bbox: str,
+    domain_satellite: str,
+    domain_nowcast: str,
     dataset_name: str,
-    bbox_choice: str,
+    domain_satellite_name: str,
     nowcast_config: NowcastConfig,
     s3_config: S3Config,
+    full_ensemble: bool = False,
     custom_time: bool = True,
 ) -> RunResult:
     """Run a single nowcast for the given (already-rounded) time step.
@@ -179,11 +230,14 @@ def run_nowcast(
         time_step: The time step to produce a forecast for.
         run_mode: One of 'download', 'files', or 's3'.
         config: Dataset configuration dict.
-        bbox: Bounding box string.
+        domain_satellite: Domain string used for satellite input coverage.
+        domain_nowcast: Domain string used for output cropping.
         dataset_name: Name of dataset.
-        bbox_choice: Bounding box identifier.
+        domain_satellite_name: Domain identifier used for input filenames.
         nowcast_config: NowcastConfig object.
         s3_config: S3Config object.
+        full_ensemble: If True, save all ensemble members. If False,
+            save configured ensemble statistics over ensemble members.
         custom_time: If True, skip the retry wait loop on missing data.
 
     Returns:
@@ -192,15 +246,20 @@ def run_nowcast(
     """
     time_step_str = time_step.strftime("%Y-%m-%dT%H:%M:%SZ")
     logger.info(f"--- Running nowcast for {time_step_str} ---")
+    nc_variable_names = config["nc_variable_names"].copy()
+    clearsky_config = config.get(
+        "clearsky",
+        {"method": "file", "path": config["filename_format"]},
+    )
 
     # Fetch current data (with retry loop in operational mode)
     fetch_current_data_with_retry(
         time_step,
         run_mode,
         config,
-        bbox,
+        domain_satellite,
         dataset_name,
-        bbox_choice,
+        domain_satellite_name,
         nowcast_config,
         s3_config,
         custom_time=custom_time,
@@ -208,9 +267,14 @@ def run_nowcast(
 
     # Check solar elevation
     try:
-        solar_elevation = check_solar_elevation(time_step)
-        logger.info(f"Solar elevation: {solar_elevation:.2f} degrees")
-        if solar_elevation < 1:
+        lon_min, lat_min, lon_max, lat_max = map(float, domain_satellite.split(","))
+        solar_elevation = max(
+            check_solar_elevation(time_step, lat=lat, lon=lon)
+            for lat in (lat_min, lat_max)
+            for lon in (lon_min, lon_max)
+        )
+        logger.info(f"Maximum corner solar elevation: {solar_elevation:.2f} degrees")
+        if solar_elevation < nowcast_config.min_solar_elevation_degrees:
             reason = "sun too low"
             logger.warning(f"{reason.capitalize()}. Skipping.\n")
             return RunResult(
@@ -233,37 +297,70 @@ def run_nowcast(
     logger.info(f"Loading past data for {len(past_time_steps)} time steps...")
     match run_mode:
         case "download":
-            data = download_past_data(past_time_steps, config, bbox, dataset_name)
+            data = download_past_data(
+                past_time_steps,
+                config,
+                domain_satellite,
+                dataset_name,
+            )
         case "files":
             data = load_data_from_files(
                 past_time_steps,
                 dataset_name,
-                bbox_choice,
+                domain_satellite_name,
                 nowcast_config.satellite_data_directory,
                 "past data",
                 config["filename_format"],
-                bbox=bbox,
+                bbox=domain_satellite,
             )
         case "s3":
             data = load_data_from_s3(
                 past_time_steps,
                 dataset_name,
-                bbox_choice,
+                domain_satellite_name,
                 s3_config,
                 "past data",
                 config["filename_format"],
-                bbox=bbox,
+                bbox=domain_satellite,
             )
 
     n_loaded = len(data.time) if "time" in data.coords else 0
     logger.info(f"Loaded {n_loaded} past data timesteps")
     if n_loaded == 0:
         raise RuntimeError("No past data loaded. Cannot proceed.")
+    if run_mode in {"files", "s3"}:
+        validate_dataset_covers_domain(data, domain_satellite, "Input dataset")
+
+    if clearsky_config["method"] == "pvlib":
+        latitudes, longitudes = get_coordinates(data)
+        data = data.merge(
+            make_pvlib_clearsky_dataset(
+                past_time_steps,
+                latitudes,
+                longitudes,
+                nc_variable_names["sds_cs"],
+            )
+        )
+    elif clearsky_config["path"] != config["filename_format"]:
+        logger.info("Loading separate clearsky data for past observations...")
+        clearsky_data = fetch_clearsky_with_fallback(
+            past_time_steps,
+            run_mode,
+            nowcast_config.max_clearsky_fallback_days,
+            clearsky_config["path"],
+            config,
+            domain_nowcast,
+            dataset_name,
+            domain_satellite_name,
+            nowcast_config,
+            s3_config,
+        )
+        data = data.merge(clearsky_data[[nc_variable_names["sds_cs"]]])
 
     # Preprocess
     logger.info("Preprocessing data...")
     ratio_data, latitudes, longitudes = preprocess_data(
-        data, past_time_steps, config["nc_variable_names"]
+        data, past_time_steps, nc_variable_names
     )
 
     # Validate data shape
@@ -273,9 +370,38 @@ def run_nowcast(
     # Compute motion field
     motion_field = dense_lucaskanade(ratio_data)
 
-    # Simple forecast (ratio forecast)
-    ratio_forecast = simple_advection_forecast(
-        ratio_data, motion_field, nowcast_config.future_steps
+    # Probabilistic advection forecast (ratio forecast)
+    ratio_forecast = probabilistic_advection_forecast(
+        ratio_data,
+        motion_field,
+        nowcast_config.future_steps,
+        ens_members=nowcast_config.ens_members,
+        alpha=nowcast_config.alpha,
+        beta=nowcast_config.beta,
+    )
+
+    # Keep a consistent 4-D layout: [ensemble, time, lat, lon].
+    if ratio_forecast.ndim == 3:
+        ratio_forecast = ratio_forecast[np.newaxis, :, :, :]
+    elif ratio_forecast.ndim != 4:
+        raise ValueError(
+            "Forecast must have shape (time, lat, lon) or " "(ensemble, time, lat, lon)."
+        )
+
+    input_latitudes = latitudes
+    input_longitudes = longitudes
+
+    ratio_data, _, _ = crop_forecast_to_domain(
+        ratio_data,
+        input_latitudes,
+        input_longitudes,
+        domain_nowcast,
+    )
+    ratio_forecast, latitudes, longitudes = crop_forecast_to_domain(
+        ratio_forecast,
+        input_latitudes,
+        input_longitudes,
+        domain_nowcast,
     )
 
     # Generate previous day time steps for clearsky lookup
@@ -290,32 +416,49 @@ def run_nowcast(
     clearsky_t0_time = time_step - timedelta(days=1)
     all_clearsky_time_steps = [clearsky_t0_time] + previous_day_time_steps
 
-    # Fetch clearsky data with fallback to earlier days if a file is missing
-    logger.info("Fetching clearsky data...")
-    clearsky_data = fetch_clearsky_with_fallback(
-        all_clearsky_time_steps,
-        run_mode,
-        nowcast_config.max_clearsky_fallback_days,
-        config,
-        bbox,
-        dataset_name,
-        bbox_choice,
-        nowcast_config,
-        s3_config,
-    )
+    if clearsky_config["method"] == "pvlib":
+        logger.info("Generating pvlib clearsky data...")
+        clearsky_data = make_pvlib_clearsky_dataset(
+            all_clearsky_time_steps,
+            latitudes,
+            longitudes,
+            nc_variable_names["sds_cs"],
+        )
+    else:
+        # Fetch clearsky data with fallback to earlier days if a file is missing
+        logger.info("Fetching clearsky data...")
+        clearsky_data = fetch_clearsky_with_fallback(
+            all_clearsky_time_steps,
+            run_mode,
+            nowcast_config.max_clearsky_fallback_days,
+            clearsky_config["path"],
+            config,
+            domain_nowcast,
+            dataset_name,
+            domain_satellite_name,
+            nowcast_config,
+            s3_config,
+        )
+
+    if run_mode in {"files", "s3"} and clearsky_data.sizes.get("time", 0) > 0:
+        validate_dataset_covers_domain(
+            clearsky_data,
+            domain_nowcast,
+            "Clearsky dataset",
+        )
 
     # Validate clearsky data
     try:
-        validate_clearsky_completeness(clearsky_data, previous_day_time_steps)
+        validate_clearsky_completeness(clearsky_data, all_clearsky_time_steps)
     except MissingClearskyDataError as e:
         raise RuntimeError(f"Missing clearsky data: {e}") from e
 
     expected_spatial_shape = (len(latitudes), len(longitudes))
     validate_clearsky_shapes(
         clearsky_data,
-        previous_day_time_steps,
+        all_clearsky_time_steps,
         expected_spatial_shape,
-        config["nc_variable_names"],
+        nc_variable_names,
     )
 
     # Multiply by clearsky to get actual solar irradiance
@@ -324,19 +467,40 @@ def run_nowcast(
         ratio_forecast,
         clearsky_data,
         previous_day_time_steps,
-        config["nc_variable_names"],
+        nc_variable_names,
     )
 
-    # Prepend timestep 0: current observation (ratio_data[-1]) × clearsky at t=0
-    sds_cs_t0 = clearsky_data.sel(time=clearsky_t0_time.replace(tzinfo=None))[
-        config["nc_variable_names"]["sds_cs"]
-    ].values
-    solar_t0 = ratio_data[-1] * sds_cs_t0
-    solar_forecast = np.concatenate([solar_t0[np.newaxis, :, :], solar_forecast], axis=0)
+    solar_forecast = prepend_t0(
+        clearsky_data, ratio_data, solar_forecast, config, clearsky_t0_time
+    )
+
+    if full_ensemble:
+        output_forecast = solar_forecast
+        output_mode = "full_ensemble"
+        logger.info("Saving full ensemble forecast")
+    else:
+        if solar_forecast.shape[0] == 1:
+            output_forecast = solar_forecast
+            output_mode = "deterministic"
+            logger.info(
+                "Saving deterministic forecast "
+                "(single ensemble member, kept as singleton ensemble dimension)"
+            )
+        else:
+            output_forecast = compute_ensemble_statistics(
+                solar_forecast,
+                nowcast_config.ensemble_statistics,
+            )
+            output_mode = "ensemble_statistics"
+            logger.info(
+                "Saving ensemble statistics across members: "
+                f"{', '.join(nowcast_config.ensemble_statistics)} "
+                "(each with singleton ensemble dimension)"
+            )
 
     # Save forecast (now contains actual solar irradiance, not ratios)
     filename = save_forecast(
-        solar_forecast,
+        output_forecast,
         time_step,
         nowcast_config.future_steps + 1,  # +1 for the t=0 analysis step
         latitudes,
@@ -344,6 +508,7 @@ def run_nowcast(
         dataset_name,
         nowcast_config,
         model_version,
+        output_mode,
         run_mode,
         s3_config,
     )
@@ -389,14 +554,44 @@ def cli() -> None:
     )
 
     # Load configuration
-    nowcast_config = NowcastConfig.from_env()
-    s3_config = S3Config.from_env()
     args = parse_arguments()
+    nowcast_config = NowcastConfig.from_env(ensemble_members=args.ensemble_members)
+    s3_config = S3Config.from_env()
 
     run_mode = args.run_mode
     dataset_name = args.dataset
-    bbox_choice = args.bbox
-    bbox = get_bbox(bbox_choice, args.custom_bbox)
+    domain_satellite_name = args.domain_satellite
+    domain_satellite = resolve_domain_bbox(
+        domain_satellite_name,
+        args.custom_domain_satellite,
+    )
+    if domain_satellite is None:
+        raise RuntimeError(
+            "domain_satellite could not be resolved. "
+            "Use a predefined choice or provide --custom_domain_satellite."
+        )
+
+    domain_nowcast_name = args.domain_nowcast
+    if domain_nowcast_name is None:
+        domain_nowcast_name = domain_satellite_name
+        domain_nowcast = domain_satellite
+    else:
+        domain_nowcast = resolve_domain_bbox(
+            domain_nowcast_name,
+            args.custom_domain_nowcast,
+        )
+        if domain_nowcast is None:
+            raise RuntimeError(
+                "domain_nowcast could not be resolved. "
+                "Use a predefined choice or provide --custom_domain_nowcast."
+            )
+
+    if not domain_contains(domain_satellite, domain_nowcast):
+        raise RuntimeError(
+            "domain_nowcast must be fully contained within domain_satellite. "
+            f"Got domain_satellite={domain_satellite}, "
+            f"domain_nowcast={domain_nowcast}."
+        )
 
     config = yaml.safe_load(open("config.yaml"))[dataset_name]
 
@@ -405,10 +600,36 @@ def cli() -> None:
 
     logger.info(f"Running in {run_mode} mode")
     logger.info(f"Using {dataset_name} dataset")
-    logger.info(f"Using {bbox_choice} bbox: {bbox}")
+    logger.info(f"Using satellite domain {domain_satellite_name}: {domain_satellite}")
+    logger.info(f"Using nowcast domain {domain_nowcast_name}: {domain_nowcast}")
+    logger.info(f"Number of ensemble members: {nowcast_config.ens_members}")
+    if args.full_ensemble:
+        logger.info("Output mode: full ensemble")
+    elif nowcast_config.ens_members == 1:
+        logger.info("Output mode: deterministic")
+    else:
+        logger.info(
+            "Output mode: ensemble statistics "
+            f"({', '.join(nowcast_config.ensemble_statistics)})"
+        )
+    logger.info(
+        f"Using probabilistic advection noise parameters alpha={nowcast_config.alpha}, "
+        f"beta={nowcast_config.beta}"
+    )
+
+    if nowcast_config.ens_members == 1 and (
+        nowcast_config.alpha != 0.0 or nowcast_config.beta != 0.0
+    ):
+        logger.warning(
+            "Running with a single ensemble member, but non-zero probabilistic advection"
+            "noise parameters alpha and/or beta. This is generally not recommended as it"
+            "simply adds noise to the nowcast without providing any ensemble spread. "
+            "Consider setting alpha=0.0 and beta=0.0 for a single-member run."
+        )
 
     validate_run_mode(run_mode, dataset_name)
     validate_config(config, dataset_name)
+    validate_nowcast_config(nowcast_config)
     verify_environment_variables(run_mode, dataset_name)
 
     # Determine the time steps to run
@@ -454,11 +675,13 @@ def cli() -> None:
                 time_step,
                 run_mode,
                 config,
-                bbox,
+                domain_satellite,
+                domain_nowcast,
                 dataset_name,
-                bbox_choice,
+                domain_satellite_name,
                 nowcast_config,
                 s3_config,
+                full_ensemble=args.full_ensemble,
                 custom_time=custom_time,
             )
             results.append(result)

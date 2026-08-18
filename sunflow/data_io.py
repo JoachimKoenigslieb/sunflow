@@ -11,7 +11,7 @@ import xarray as xr
 from loguru import logger
 
 from .config import NowcastConfig, S3Config
-from .geospatial import subset_to_bbox
+from .geospatial import subset_to_bbox, validate_dataset_covers_domain
 from .validation import DataNotAvailableError
 
 
@@ -19,9 +19,9 @@ def fetch_current_data_with_retry(
     time_step: datetime,
     run_mode: str,
     config: dict[str, Any],
-    bbox: str,
+    domain_satellite: str,
     dataset_name: str,
-    bbox_choice: str,
+    domain_satellite_name: str,
     nowcast_config: NowcastConfig,
     s3_config: S3Config,
     custom_time: bool = False,
@@ -32,9 +32,9 @@ def fetch_current_data_with_retry(
         time_step: Datetime object for data to fetch
         run_mode: One of 'download', 'files', or 's3'
         config: Dataset configuration dict
-        bbox: Bounding box string
+        domain_satellite: Domain string for required satellite input coverage
         dataset_name: Name of dataset (options: KNMI, DWD)
-        bbox_choice: Bounding box choice string
+        domain_satellite_name: Domain choice used in input filenames
         nowcast_config: NowcastConfig object
         s3_config: S3Config object
         custom_time: Whether a custom time was specified (no retry if True)
@@ -57,26 +57,28 @@ def fetch_current_data_with_retry(
                     download_current_data(
                         time_step,
                         config,
-                        bbox,
+                        domain_satellite,
                         dataset_name,
-                        bbox_choice,
+                        domain_satellite_name,
                         nowcast_config.satellite_data_directory,
                     )
                 case "files":
                     check_current_data_existence_file(
                         time_step,
                         dataset_name,
-                        bbox_choice,
+                        domain_satellite_name,
                         nowcast_config.satellite_data_directory,
                         config["filename_format"],
+                        domain_satellite,
                     )
                 case "s3":
                     check_current_data_existence_s3(
                         time_step,
                         dataset_name,
-                        bbox_choice,
+                        domain_satellite_name,
                         s3_config,
                         config["filename_format"],
+                        domain_satellite,
                     )
 
             logger.info(f"Data successfully retrieved for {time_step_str}")
@@ -108,7 +110,7 @@ def fetch_current_data_with_retry(
 def generate_input_filename(
     time_step: datetime,
     dataset_name: str,
-    bbox_choice: str,
+    domain_satellite_name: str,
     filename_format: str,
 ) -> str:
     """Generate input filename based on a format template string.
@@ -118,7 +120,7 @@ def generate_input_filename(
     Args:
         time_step: Datetime of the data timestep.
         dataset_name: Name of dataset (options: KNMI, DWD).
-        bbox_choice: Bounding box identifier.
+        domain_satellite_name: Satellite domain identifier.
         filename_format: Template string from config['filename_format'].
 
     Returns:
@@ -126,34 +128,36 @@ def generate_input_filename(
 
     Template variables supported:
         {dataset_name}: Name of the dataset
-        {bbox_choice}: Bounding box identifier
+        {domain_satellite_name}: Satellite domain identifier
         {timestamp}: Compact format YYYYMMDDHHMM
         {pds_timestamp}: PDS format YYYY-MM-DDTHH_MM_SSZ
         {year}: Four-digit year (e.g. 2026)
         {month}: Two-digit month (e.g. 03)
         {day}: Two-digit day (e.g. 09)
         {hour}: Two-digit hour (e.g. 12)
+        {minute}: Two-digit minute (e.g. 30)
+        {seconds}: Two-digit seconds (e.g. 00)
 
     Path separators in the result are supported, so a format like
     ``{year}/{month}/{day}/{dataset_name}_{timestamp}.nc`` resolves to a
     file inside a date-structured subdirectory of *satellite_data_directory*.
     """
-    format_template = filename_format
-
     # Generate both time formats
     timestamp_compact = time_step.strftime("%Y%m%d%H%M")
     timestamp_pds = time_step.strftime("%Y-%m-%dT%H_%M_%SZ")
 
     # Substitute template variables
-    filename = format_template.format(
+    filename = filename_format.format(
         dataset_name=dataset_name,
-        bbox_choice=bbox_choice,
+        domain_satellite_name=domain_satellite_name,
         timestamp=timestamp_compact,
         pds_timestamp=timestamp_pds,
         year=time_step.strftime("%Y"),
         month=time_step.strftime("%m"),
         day=time_step.strftime("%d"),
         hour=time_step.strftime("%H"),
+        minute=time_step.strftime("%M"),
+        seconds=time_step.strftime("%S"),
     )
     return filename
 
@@ -161,35 +165,46 @@ def generate_input_filename(
 def check_current_data_existence_file(
     request_time: datetime,
     dataset_name: str,
-    bbox_choice: str,
+    domain_satellite_name: str,
     satellite_data_directory: str,
     filename_format: str,
+    required_domain: str | None = None,
 ) -> None:
     """Check for existence of current data file.
 
     Args:
         request_time: Python datetime object.
         dataset_name: Name of dataset (options: KNMI, DWD).
-        bbox_choice: Bounding box identifier.
+        domain_satellite_name: Satellite domain identifier.
         satellite_data_directory: Directory containing data files.
         filename_format: Template string from config['filename_format'].
+        required_domain: Optional domain string that must be covered by the file.
 
     Raises:
         FileNotFoundError: If the expected file does not exist.
+        RuntimeError: If required_domain is provided and file coverage is insufficient.
     """
     filename = generate_input_filename(
-        request_time, dataset_name, bbox_choice, filename_format
+        request_time, dataset_name, domain_satellite_name, filename_format
     )
     filepath = os.path.join(satellite_data_directory, filename)
     logger.info(f"Checking existence of data at {filepath}")
     if not os.path.exists(filepath):
         raise FileNotFoundError(f"Input file not found: {filepath}")
 
+    if required_domain:
+        with xr.open_dataset(filepath) as ds:
+            validate_dataset_covers_domain(
+                ds,
+                required_domain,
+                f"Input file {filepath}",
+            )
+
 
 def load_data_from_files(
     time_steps: list[datetime],
     dataset_name: str,
-    bbox_choice: str,
+    domain_satellite_name: str,
     satellite_data_directory: str,
     data_type: str,
     filename_format: str,
@@ -200,7 +215,7 @@ def load_data_from_files(
     Args:
         time_steps: List of timesteps to load.
         dataset_name: Name of dataset (options: KNMI, DWD).
-        bbox_choice: Bounding box identifier.
+        domain_satellite_name: Satellite domain identifier.
         satellite_data_directory: Directory containing data files.
         data_type: Type of data for logging (options: past data, clearsky data).
         filename_format: Template string from config['filename_format'].
@@ -215,7 +230,7 @@ def load_data_from_files(
 
     for time_step in time_steps:
         filename = generate_input_filename(
-            time_step, dataset_name, bbox_choice, filename_format
+            time_step, dataset_name, domain_satellite_name, filename_format
         )
         filepath = os.path.join(satellite_data_directory, filename)
 
@@ -226,7 +241,15 @@ def load_data_from_files(
 
         try:
             ds = xr.open_dataset(filepath)
-            collected.append(ds.assign_coords(time=[time_step.replace(tzinfo=None)]))
+            time_step_naive = time_step.replace(tzinfo=None)
+
+            # Ensure time is in both dimension and in coords.
+            if "time" in ds.dims:
+                ds = ds.assign_coords(time=[time_step_naive])
+            else:
+                ds = ds.expand_dims(time=[time_step_naive])
+
+            collected.append(ds)
             logger.info(f"Loaded {data_type} from {filepath}")
         except Exception as e:
             logger.error(f"Failed to load {data_type} {filepath}: {e}")
@@ -241,24 +264,27 @@ def load_data_from_files(
 def check_current_data_existence_s3(
     request_time: datetime,
     dataset_name: str,
-    bbox_choice: str,
+    domain_satellite_name: str,
     s3_config: S3Config,
     filename_format: str,
+    required_domain: str | None = None,
 ) -> None:
     """Check for existence of current data file in S3.
 
     Args:
         request_time: Python datetime object.
         dataset_name: Name of dataset (options: KNMI, DWD).
-        bbox_choice: Bounding box identifier.
+        domain_satellite_name: Satellite domain identifier.
         s3_config: S3 configuration object.
         filename_format: Template string from config['filename_format'].
+        required_domain: Optional domain string that must be covered by the file.
 
     Raises:
         FileNotFoundError: If the expected file does not exist in S3.
+        RuntimeError: If required_domain is provided and file coverage is insufficient.
     """
     filename = generate_input_filename(
-        request_time, dataset_name, bbox_choice, filename_format
+        request_time, dataset_name, domain_satellite_name, filename_format
     )
     s3_path = f"s3://{s3_config.bucket}/{s3_config.input_prefix}/{filename}"
     logger.info(f"Checking existence of data at {s3_path}")
@@ -270,6 +296,16 @@ def check_current_data_existence_s3(
         )
         if not fs.exists(s3_path):
             raise FileNotFoundError(f"Input file not yet found in S3: {s3_path}")
+
+        if required_domain:
+            with fs.open(s3_path, "rb") as f:
+                with xr.open_dataset(f, engine="h5netcdf") as ds:
+                    ds_loaded = ds.load()
+            validate_dataset_covers_domain(
+                ds_loaded,
+                required_domain,
+                f"Input file {s3_path}",
+            )
     except FileNotFoundError:
         raise
     except Exception as e:
@@ -280,7 +316,7 @@ def check_current_data_existence_s3(
 def load_data_from_s3(
     time_steps: list[datetime],
     dataset_name: str,
-    bbox_choice: str,
+    domain_satellite_name: str,
     s3_config: S3Config,
     data_type: str,
     filename_format: str,
@@ -291,7 +327,7 @@ def load_data_from_s3(
     Args:
         time_steps: List of timesteps to load.
         dataset_name: Name of dataset (options: KNMI, DWD).
-        bbox_choice: Bounding box identifier.
+        domain_satellite_name: Satellite domain identifier.
         s3_config: S3 configuration object.
         data_type: Type of data for logging (options: past data, clearsky data).
         filename_format: Template string from config['filename_format'].
@@ -310,7 +346,7 @@ def load_data_from_s3(
 
     for time_step in time_steps:
         filename = generate_input_filename(
-            time_step, dataset_name, bbox_choice, filename_format
+            time_step, dataset_name, domain_satellite_name, filename_format
         )
         s3_path = f"s3://{s3_config.bucket}/{s3_config.input_prefix}/{filename}"
 
@@ -337,10 +373,11 @@ def fetch_clearsky_with_fallback(
     time_steps: list[datetime],
     run_mode: str,
     max_fallback_days: int,
+    filename_format: str,
     config: dict[str, Any],
     bbox: str,
     dataset_name: str,
-    bbox_choice: str,
+    domain_satellite_name: str,
     nowcast_config: NowcastConfig,
     s3_config: S3Config,
 ) -> xr.Dataset:
@@ -355,10 +392,11 @@ def fetch_clearsky_with_fallback(
         time_steps: Requested clearsky times (typically forecast times - 1 day).
         run_mode: One of 'download', 'files', or 's3'.
         max_fallback_days: Maximum number of days back to search per time step.
+        filename_format: Template string for clear-sky files.
         config: Dataset configuration dict.
         bbox: Bounding box string.
         dataset_name: Name of dataset (options: KNMI, DWD).
-        bbox_choice: Bounding box identifier.
+        domain_satellite_name: Satellite domain identifier.
         nowcast_config: NowcastConfig object.
         s3_config: S3Config object.
 
@@ -393,20 +431,20 @@ def fetch_clearsky_with_fallback(
                         fetched = load_data_from_files(
                             [source_time],
                             dataset_name,
-                            bbox_choice,
+                            domain_satellite_name,
                             nowcast_config.satellite_data_directory,
                             "clearsky data",
-                            config["filename_format"],
+                            filename_format,
                             bbox=bbox,
                         )
                     case "s3":
                         fetched = load_data_from_s3(
                             [source_time],
                             dataset_name,
-                            bbox_choice,
+                            domain_satellite_name,
                             s3_config,
                             "clearsky data",
-                            config["filename_format"],
+                            filename_format,
                             bbox=bbox,
                         )
 
@@ -435,7 +473,7 @@ def fetch_clearsky_with_fallback(
 
 
 def save_forecast(
-    forecast: np.ndarray,
+    forecast: np.ndarray | dict[str, np.ndarray],
     time_step: datetime,
     n_steps: int,
     latitudes: np.ndarray,
@@ -443,26 +481,30 @@ def save_forecast(
     dataset_name: str,
     nowcast_config: NowcastConfig,
     model_version: str,
+    output_mode: str,
     run_mode: str = "files",
     s3_config: S3Config | None = None,
 ) -> str:
-    """Save forecast array to a CF-compliant NetCDF4 file.
+    """Save forecast data to a CF-compliant NetCDF4 file.
 
     Writes the probabilistic advection forecast to either a local file or S3,
     depending on `run_mode`. The time coordinate is stored as CF-convention
     numeric values (float64, minutes since the forecast reference time).
 
     Args:
-        forecast: Forecast array, shape [time, lat, lon] or
-            [ensemble, time, lat, lon].
+        forecast: Forecast array with shape [ensemble, time, lat, lon],
+            or mapping of statistic name to arrays with the same shape.
         time_step: Forecast reference time (start of the forecast window).
         n_steps: Number of forecast time steps to write.
         latitudes: 1-D array of latitude values (degrees).
         longitudes: 1-D array of longitude values (degrees).
         dataset_name: Name of the source dataset (options: KNMI, DWD).
-        nowcast_config: NowcastConfig object supplying output directory,
-            ensemble size, and input data frequency.
+        nowcast_config: NowcastConfig object supplying output directory
+            and input data frequency.
         model_version: Model version string written as a global attribute.
+        output_mode: Output aggregation mode label written to global
+            NetCDF attrs (expected: 'deterministic', 'ensemble_statistics',
+            or 'full_ensemble').
         run_mode: One of 'files' (local) or 's3'. Defaults to 'files'.
         s3_config: S3Config object; required when run_mode is 's3'.
 
@@ -470,12 +512,63 @@ def save_forecast(
         Filename (basename only) of the written NetCDF file.
     """
     input_data_frequency_minutes = nowcast_config.input_data_frequency_minutes
-    ens_members = nowcast_config.ens_members
     filename = f"SolarNowcast_{time_step.strftime('%Y%m%d%H%M')}.nc"
 
-    # Add ensemble dimension if needed (forecast should be [ensemble, time, lat, lon])
-    if forecast.ndim == 3:
-        forecast = forecast[np.newaxis, :, :, :]  # Now [1, time, lat, lon]
+    data_vars: dict[str, tuple[list[str], np.ndarray, dict[str, str]]]
+    statistics_attr = ""
+
+    if isinstance(forecast, dict):
+        if not forecast:
+            raise ValueError("forecast statistics mapping cannot be empty")
+
+        data_vars = {}
+        first_shape: tuple[int, ...] | None = None
+        for statistic, values in forecast.items():
+            if values.ndim != 4:
+                raise ValueError(
+                    "Each statistic array must have shape " "(ensemble, time, lat, lon)."
+                )
+            if first_shape is None:
+                first_shape = values.shape
+            elif values.shape != first_shape:
+                raise ValueError("All statistic arrays must share the same shape")
+
+            variable_name = f"{statistic}_GHI_probabilistic_advection"
+            data_vars[variable_name] = (
+                ["ensemble", "time", "lat", "lon"],
+                values,
+                {
+                    "description": (
+                        f"Probabilistic advection solar forecast ({statistic})"
+                    ),
+                    "long_name": "Surface downwelling solar radiation",
+                    "units": "W m-2",
+                },
+            )
+
+        ens_members = first_shape[0] if first_shape is not None else 0
+        statistics_attr = ",".join(forecast.keys())
+    else:
+        if forecast.ndim != 4:
+            raise ValueError("forecast must have shape (ensemble, time, lat, lon).")
+
+        if forecast.shape[0] != nowcast_config.ens_members:
+            raise ValueError(
+                f"Forecast ensemble size {forecast.shape[0]} does not match "
+                f"expected {nowcast_config.ens_members} from config."
+            )
+        ens_members = forecast.shape[0]
+        data_vars = {
+            "GHI_probabilistic_advection": (
+                ["ensemble", "time", "lat", "lon"],
+                forecast,
+                {
+                    "description": "Probabilistic advection solar forecast",
+                    "long_name": "Surface downwelling solar radiation",
+                    "units": "W m-2",
+                },
+            ),
+        }
 
     # Build time coordinate (CF-convention: minutes since forecast reference time)
 
@@ -487,17 +580,7 @@ def save_forecast(
     ]
 
     ds = xr.Dataset(
-        {
-            "probabilistic_advection": (
-                ["ensemble", "time", "lat", "lon"],
-                forecast,
-                {
-                    "description": "Probabilistic advection solar forecast",
-                    "long_name": "Surface downwelling solar radiation",
-                    "units": "W m-2",
-                },
-            ),
-        },
+        data_vars,
         coords={
             "time": (
                 ["time"],
@@ -525,11 +608,13 @@ def save_forecast(
                 f"Simple Probabilistic Advection solar forecast "
                 f"using {dataset_name} data"
             ),
+            "output_mode": output_mode,
             "history": (
                 f"Created "
                 f"{datetime.now(timezone.utc).strftime('%Y-%m-%d %H:%M:%S')} UTC"
             ),
             "model_version": model_version,
+            **({"statistics": statistics_attr} if statistics_attr else {}),
         },
     )
 

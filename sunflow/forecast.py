@@ -2,10 +2,71 @@
 from datetime import datetime
 
 import numpy as np
+import pvlib
 import xarray as xr
 from Models.ProbabilisticAdvection import ProbabilisticAdvection
 
 from .geospatial import get_coordinates
+
+
+def make_pvlib_clearsky_dataset(
+    times: list[datetime],
+    latitudes: np.ndarray,
+    longitudes: np.ndarray,
+    variable_name: str,
+) -> xr.Dataset:
+    """Compute a pvlib simplified-Solis clear-sky GHI dataset on a lat/lon grid.
+
+    For each timestep in `times`, solar position is computed at every grid
+    point by repeating the timestamp across all (lat, lon) pairs. The
+    simplified Solis clear-sky model is then applied to the apparent solar
+    elevation to produce global horizontal irradiance (GHI) in W m⁻².
+    Longitudes are normalised to the range [-180, 180] before the solar
+    position calculation.
+
+    Args:
+        times: Ordered list of timezone-aware datetimes for which to
+            compute clear-sky irradiance.
+        latitudes: 1-D array of latitude values in degrees North.
+        longitudes: 1-D array of longitude values in degrees East
+            (values > 180 are wrapped to [-180, 180]).
+
+    Returns:
+        xr.Dataset with a single variable keyed by
+        PVLIB_CLEARSKY_VARIABLE_NAME of shape (time, latitude, longitude)
+        containing GHI in W m⁻². The time coordinate is stored without
+        timezone information.
+    """
+    lon_grid, lat_grid = np.meshgrid(longitudes, latitudes)
+    lon_grid = np.where(lon_grid > 180, lon_grid - 360, lon_grid)
+    flat_latitudes = lat_grid.ravel()
+    flat_longitudes = lon_grid.ravel()
+
+    fields = []
+    for time in times:
+        repeated_times = [time] * len(flat_latitudes)
+        solar_position = pvlib.solarposition.get_solarposition(
+            repeated_times,
+            flat_latitudes,
+            flat_longitudes,
+            method="nrel_numpy",
+        )
+        clearsky = pvlib.clearsky.simplified_solis(solar_position["apparent_elevation"])
+        fields.append(clearsky["ghi"].to_numpy().reshape(lat_grid.shape))
+
+    return xr.Dataset(
+        {
+            variable_name: (
+                ["time", "latitude", "longitude"],
+                np.stack(fields),
+            )
+        },
+        coords={
+            "time": [time.replace(tzinfo=None) for time in times],
+            "latitude": latitudes,
+            "longitude": longitudes,
+        },
+    )
 
 
 def preprocess_data(
@@ -61,18 +122,19 @@ def preprocess_data(
     )
 
 
-def simple_advection_forecast(
+def probabilistic_advection_forecast(
     ratio_data: np.ndarray,
     motion_field: np.ndarray,
     n_steps: int,
+    ens_members: int,
+    alpha: float,
+    beta: float,
 ) -> np.ndarray:
-    """Run a deterministic advection forecast on solar irradiance ratios.
+    """Run a probabilistic advection forecast on solar irradiance ratios.
 
-    Uses ProbabilisticAdvection with noise parameters alpha=0 and beta=0,
-    which disables Gaussian noise on the motion field norm and
-    von Mises noise on the direction, yielding a purely deterministic
-    advection result. The ensemble dimension added by the model is removed
-    before returning.
+    Uses ProbabilisticAdvection with configurable noise parameters:
+    alpha controls Gaussian noise on motion field norm and beta controls
+    von Mises noise on motion field direction.
 
     Args:
         ratio_data: Input array of shape (time, lat, lon) containing
@@ -80,23 +142,24 @@ def simple_advection_forecast(
         motion_field: Optical flow field of shape (2, lat, lon) as
             produced by dense_lucaskanade.
         n_steps: Number of forecast timesteps to produce.
+        ens_members: Number of ensemble members.
+        alpha: Gaussian noise strength on motion field norm.
+        beta: von Mises noise strength on motion field angle.
 
     Returns:
-        Forecast array of shape (n_steps, lat, lon).
+        Forecast array of shape (n_steps, lat, lon) for deterministic forecasts
+        and (ensemble, n_steps, lat, lon) for multi-member ensemble forecasts.
     """
 
-    # Initialize ProbabilisticAdvection with NO noise (alpha=0, beta=0)
+    # Initialize ProbabilisticAdvection with configured noise settings.
     pa = ProbabilisticAdvection(
-        alpha=0.0,  # No Gaussian noise on motion field norm
-        beta=0.0,  # No von Mises noise on motion field angle
+        alpha=alpha,
+        beta=beta,
         return_motion_field=False,
+        ens_members=ens_members,
     )
     # Run probabilistic advection using the correct method name
     forecast = pa.maps_forecast(n_steps, ratio_data, motion_field)
-
-    # Remove ensemble dimension if present (squeeze to get shape: [time, lat, lon])
-    if forecast.ndim == 4:  # [ensemble, time, lat, lon]
-        forecast = forecast[0]  # Take first (and only) ensemble member
 
     return forecast
 
@@ -116,7 +179,7 @@ def multiply_clearsky(
 
     Args:
         ratio_forecast: Forecast array of shape (n_steps, lat, lon)
-            containing SDS/SDS_CS ratios.
+            or (ensemble, n_steps, lat, lon) containing SDS/SDS_CS ratios.
         clearsky_data: xarray Dataset with a 'time' dimension containing
             the clearsky variable for each forecast step.
         previous_day_time_steps: List of datetimes (one per forecast step)
@@ -125,26 +188,129 @@ def multiply_clearsky(
             NetCDF variable name in the datasets.
 
     Returns:
-        Solar irradiance forecast array of shape (n_steps, lat, lon)
+        Solar irradiance forecast array with dimensions [ensemble, n_steps, lat, lon] if
+        ratio_forecast has an ensemble dimension, or [1, n_steps, lat, lon] if not,
         in W m⁻².
 
     Raises:
         RuntimeError: If clearsky data is missing for any forecast timestep.
     """
-    solar_forecast = np.zeros_like(ratio_forecast)
+    clearsky_steps: list[np.ndarray] = []
 
-    for i, time_step in enumerate(previous_day_time_steps):
+    for time_step in previous_day_time_steps:
         try:
             sds_cs = clearsky_data.sel(time=time_step.replace(tzinfo=None))[
                 nc_variable_names["sds_cs"]
             ].values
-
-            # Multiply ratio by clearsky
-            solar_forecast[i] = ratio_forecast[i] * sds_cs
+            clearsky_steps.append(sds_cs)
         except KeyError:
             raise RuntimeError(
                 f"No clearsky data for {time_step.strftime('%Y-%m-%dT%H:%M:%SZ')}, "
                 "cannot compute solar forecast for this step."
             )
 
+    clearsky_stack = np.stack(clearsky_steps, axis=0)
+
+    if ratio_forecast.ndim == 3:
+        if ratio_forecast.shape[0] != clearsky_stack.shape[0]:
+            raise ValueError(
+                "ratio_forecast time dimension does not match clearsky timesteps "
+                f"({ratio_forecast.shape[0]} != {clearsky_stack.shape[0]})."
+            )
+        solar_forecast = ratio_forecast * clearsky_stack
+        return solar_forecast[
+            np.newaxis, :, :, :
+        ]  # Add ensemble dimension for consistency
+
+    if ratio_forecast.ndim == 4:
+        if ratio_forecast.shape[1] != clearsky_stack.shape[0]:
+            raise ValueError(
+                "ratio_forecast time dimension does not match clearsky timesteps "
+                f"({ratio_forecast.shape[1]} != {clearsky_stack.shape[0]})."
+            )
+        return ratio_forecast * clearsky_stack[np.newaxis, :, :, :]
+
+    raise ValueError(
+        "ratio_forecast must have shape (time, lat, lon) or "
+        "(ensemble, time, lat, lon)."
+    )
+
+
+def prepend_t0(
+    clearsky_data: xr.Dataset,
+    ratio_data: np.ndarray,
+    solar_forecast: np.ndarray,
+    config: dict,
+    clearsky_t0_time: datetime,
+) -> np.ndarray:
+    """Prepend analysis timestep (t=0) to an ensemble solar forecast.
+
+    Computes the t=0 solar field as the latest observed ratio
+    (ratio_data[-1]) multiplied by clearsky irradiance at clearsky_t0_time,
+    then prepends that field to all ensemble members in solar_forecast.
+
+    Args:
+        clearsky_data: Dataset containing clearsky irradiance values on
+            a time axis.
+        ratio_data: Ratio history array with shape (time, lat, lon).
+        solar_forecast: Forecast array with shape
+            (ensemble, forecast_time, lat, lon).
+        config: Runtime configuration dict containing
+            config["nc_variable_names"]["sds_cs"].
+        clearsky_t0_time: Timestamp for the analysis clearsky field,
+            typically one day before the nowcast time.
+
+    Returns:
+        Array of shape (ensemble, forecast_time + 1, lat, lon)
+        with the analysis field inserted at index 0 along the time axis.
+    """
+    # Prepend timestep 0: current observation (ratio_data[-1]) × clearsky at t=0.
+    # Assumes ratio_data and clearsky_data were prepared for the same spatial domain.
+    sds_cs_t0 = clearsky_data.sel(time=clearsky_t0_time.replace(tzinfo=None))[
+        config["nc_variable_names"]["sds_cs"]
+    ].values
+    if ratio_data[-1].shape != sds_cs_t0.shape:
+        raise ValueError(
+            "Spatial shape mismatch for t0 prepend: "
+            f"ratio_data[-1] has shape {ratio_data[-1].shape}, "
+            f"but clearsky t0 has shape {sds_cs_t0.shape}. "
+            "Ensure both inputs are fetched/cropped for the same nowcast domain."
+        )
+    solar_t0 = ratio_data[-1] * sds_cs_t0
+
+    # Broadcast the same t=0 clearsky-based analysis field to all ensembles.
+    solar_t0_ens = np.broadcast_to(
+        solar_t0,
+        (solar_forecast.shape[0],) + solar_t0.shape,
+    )
+    solar_forecast = np.concatenate(
+        [solar_t0_ens[:, np.newaxis, :, :], solar_forecast],
+        axis=1,
+    )
     return solar_forecast
+
+
+def compute_ensemble_statistics(
+    forecast: np.ndarray,
+    statistics: list[str],
+) -> dict[str, np.ndarray]:
+    """Compute requested statistics over ensemble members (axis 0)."""
+    computed: dict[str, np.ndarray] = {}
+    for statistic in statistics:
+        match statistic:
+            case "median":
+                computed["median"] = np.median(forecast, axis=0, keepdims=True)
+            case "mean":
+                computed["mean"] = np.mean(forecast, axis=0, keepdims=True)
+            case "p10":
+                computed["p10"] = np.percentile(forecast, 10, axis=0, keepdims=True)
+            case "p25":
+                computed["p25"] = np.percentile(forecast, 25, axis=0, keepdims=True)
+            case "p75":
+                computed["p75"] = np.percentile(forecast, 75, axis=0, keepdims=True)
+            case "p90":
+                computed["p90"] = np.percentile(forecast, 90, axis=0, keepdims=True)
+            case _:  # Defensive check; config parsing validates these values.
+                raise ValueError(f"Unsupported ensemble statistic: {statistic}")
+
+    return computed
