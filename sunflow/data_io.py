@@ -136,7 +136,7 @@ def generate_input_filename(
         {day}: Two-digit day (e.g. 09)
         {hour}: Two-digit hour (e.g. 12)
         {minute}: Two-digit minute (e.g. 30)
-        {seconds}: Two-digit seconds (e.g. 00)
+        {second}: Two-digit second (e.g. 00)
 
     Path separators in the result are supported, so a format like
     ``{year}/{month}/{day}/{dataset_name}_{timestamp}.nc`` resolves to a
@@ -157,7 +157,7 @@ def generate_input_filename(
         day=time_step.strftime("%d"),
         hour=time_step.strftime("%H"),
         minute=time_step.strftime("%M"),
-        seconds=time_step.strftime("%S"),
+        second=time_step.strftime("%S"),
     )
     return filename
 
